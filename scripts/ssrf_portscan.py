@@ -9,6 +9,7 @@ Usage examples:
   python ssrf_portscan.py -u https://cohort.htb/api/validate -p 1-1024 -T4
   python ssrf_portscan.py -u https://cohort.htb/api/validate --endpoint 127.1 -p 80,443,8888,5000
   python ssrf_portscan.py -u https://cohort.htb/api/validate -F --endpoint 0x7f000001
+  python ssrf_portscan.py -u https://cohort.htb/api/validate -F --grep "ok.: true"
 """
 
 import argparse
@@ -96,11 +97,17 @@ def build_parser() -> argparse.ArgumentParser:
             "--endpoint 127.1 -p 80,443,5000,8888\n"
             "  python ssrf_portscan.py -u https://cohort.htb/api/validate "
             "--endpoint 0x7f000001 -F -t 0.5\n"
+            "  python ssrf_portscan.py -u https://cohort.htb/api/validate -F "
+            "--grep 'ok.: true'\n"
+            "  python ssrf_portscan.py -u https://cohort.htb/api/validate -F "
+            "--grep -i 'marimo|fetched_status.: 200'\n"
             "\n"
             "Filter notes (ffuf-style):\n"
             "  -fc / -fs / -fl / -fw accept comma-separated values and ranges\n"
             "  Example: -fc 404,500-503   -fs 89,120-150\n"
-            "  Results that match any filter are suppressed (OR logic)."
+            "  --grep filters on the full response body (case-sensitive by default).\n"
+            "  Use --grep -i 'pattern' for case-insensitive (pass -i as first arg).\n"
+            "  Results that match any exclude filter are suppressed (OR logic)."
         ),
     )
 
@@ -199,6 +206,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Match (show) only these response sizes",
     )
+    parser.add_argument(
+        "--grep",
+        type=str,
+        default="",
+        metavar="PATTERN",
+        help=(
+            "Show only responses whose body matches this regex (like Burp/grep).\n"
+            "Case-sensitive by default. Prefix with '-i ' for case-insensitive.\n"
+            "Example: --grep 'ok.: true'   or   --grep -i 'marimo|fetched_status.: 200'"
+        ),
+    )
 
     # Output / behaviour
     parser.add_argument(
@@ -227,6 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ANSI colours",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the complete response body (no truncation). Default truncates preview.",
+    )
+    parser.add_argument(
+        "--preview-len",
+        type=int,
+        default=70,
+        help="Max characters shown in the RESPONSE column when not using --full (default: 70)",
+    )
 
     return parser
 
@@ -243,6 +272,7 @@ def main() -> None:
     C_RED = "\033[31m" if use_color else ""
     C_CYAN = "\033[36m" if use_color else ""
     C_DIM = "\033[2m" if use_color else ""
+    C_MAGENTA = "\033[35m" if use_color else ""
 
     # Filters
     filter_codes = parse_range_string(args.fc)
@@ -252,6 +282,24 @@ def main() -> None:
     match_codes = parse_range_string(args.mc)
     match_sizes = parse_range_string(args.ms)
     filter_regex = re.compile(args.fr, re.IGNORECASE) if args.fr else None
+
+    # --grep handling (supports optional leading "-i " for case-insensitive)
+    grep_pattern = args.grep.strip()
+    grep_re = None
+    if grep_pattern:
+        flags = 0
+        if grep_pattern.startswith("-i "):
+            flags = re.IGNORECASE
+            grep_pattern = grep_pattern[3:].strip()
+        elif grep_pattern.startswith("-i"):
+            flags = re.IGNORECASE
+            grep_pattern = grep_pattern[2:].strip()
+        if grep_pattern:
+            try:
+                grep_re = re.compile(grep_pattern, flags)
+            except re.error as e:
+                print(f"{C_RED}[-] Invalid --grep regex: {e}{C_RESET}")
+                sys.exit(1)
 
     # Timing
     chosen_template_id = args.T if args.T is not None else 3
@@ -314,16 +362,25 @@ def main() -> None:
         f"| Timeout: {timeout_val}s | Delay: {scan_delay}s{C_RESET}"
     )
     print(f"{C_CYAN}[*] Mode            : {port_mode_desc} ({total_ports} targets){C_RESET}")
-    if filter_codes or filter_sizes or filter_lines or filter_words or filter_regex or match_codes or match_sizes:
-        print(f"{C_CYAN}[*] Filters active  : yes{C_RESET}")
+    active_filters = []
+    if filter_codes or filter_sizes or filter_lines or filter_words or filter_regex:
+        active_filters.append("exclude")
+    if match_codes or match_sizes:
+        active_filters.append("match")
+    if grep_re:
+        active_filters.append(f"grep={grep_pattern!r}")
+    if active_filters:
+        print(f"{C_CYAN}[*] Filters active  : {', '.join(active_filters)}{C_RESET}")
+    if args.full:
+        print(f"{C_CYAN}[*] Response mode   : FULL body{C_RESET}")
     print(f"{C_CYAN}[*] Press [Enter] for progress, [Ctrl+C] to exit.{C_RESET}\n")
 
-    # Header
+    # Header – TIME column is precise elapsed for the HTTP request only
     print(
-        f"{'PORT':<8} | {'STATUS':<6} | {'SIZE':<7} | {'WORDS':<6} | "
-        f"{'LINES':<6} | RESPONSE PREVIEW"
+        f"{'PORT':<8} | {'STATUS':<6} | {'SIZE':<7} | {'TIME':<8} | "
+        f"{'WORDS':<6} | {'LINES':<6} | RESPONSE"
     )
-    print("-" * 90)
+    print("-" * 100)
 
     start_time = time.time()
 
@@ -335,6 +392,13 @@ def main() -> None:
             target_url = f"{scheme}://{endpoint}:{port}{path}"
             payload = {"url": target_url, "format": args.format}
 
+            # ------------------------------------------------------------------
+            # Precise timing: ONLY the network round-trip (send → recv).
+            # time.perf_counter() is monotonic and high-resolution.
+            # We measure strictly around requests.post(); no Python overhead
+            # from grepping, printing, lock acquisition, etc. is included.
+            # ------------------------------------------------------------------
+            t0 = time.perf_counter()
             try:
                 resp = requests.post(
                     api_url,
@@ -343,6 +407,7 @@ def main() -> None:
                     verify=False,
                     timeout=timeout_val,
                 )
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0  # milliseconds
 
                 status = resp.status_code
                 body = resp.text
@@ -382,25 +447,57 @@ def main() -> None:
                         print(f"{C_DIM}{port:<8} | {status:<6} | filtered (-fr){C_RESET}", flush=True)
                     continue
 
+                # --grep : keep only matching bodies
+                if grep_re and not grep_re.search(body):
+                    if args.verbose:
+                        print(f"{C_DIM}{port:<8} | {status:<6} | filtered (--grep){C_RESET}", flush=True)
+                    continue
+
                 # Interesting hit
                 with lock:
                     interesting_count += 1
 
-                preview = body.replace("\n", " ").replace("\r", " ")[:55]
-                # Colour interesting results (especially non-405 / larger bodies)
-                color = C_GREEN if status not in (405, 404) or size > 60 else C_YELLOW
-                print(
-                    f"{color}{port:<8} | {status:<6} | {size:<7} | {words:<6} | "
-                    f"{lines:<6} | {preview}{C_RESET}",
-                    flush=True,
-                )
+                # Response display
+                if args.full:
+                    display_body = body.replace("\r", "")
+                    # multi-line full dump under the row
+                    time_str = f"{elapsed_ms:.1f}ms"
+                    color = C_GREEN if ("\"ok\": true" in body or size > 100) else C_YELLOW
+                    print(
+                        f"{color}{port:<8} | {status:<6} | {size:<7} | {time_str:<8} | "
+                        f"{words:<6} | {lines:<6} |{C_RESET}",
+                        flush=True,
+                    )
+                    # Indent the full JSON for readability
+                    for line in display_body.splitlines() or [display_body]:
+                        print(f"         {C_MAGENTA}{line}{C_RESET}", flush=True)
+                    print(flush=True)
+                else:
+                    preview = body.replace("\n", " ").replace("\r", " ")
+                    if len(preview) > args.preview_len:
+                        preview = preview[: args.preview_len] + "…"
+                    time_str = f"{elapsed_ms:.1f}ms"
+                    color = C_GREEN if ("\"ok\": true" in body or size > 100) else C_YELLOW
+                    print(
+                        f"{color}{port:<8} | {status:<6} | {size:<7} | {time_str:<8} | "
+                        f"{words:<6} | {lines:<6} | {preview}{C_RESET}",
+                        flush=True,
+                    )
 
             except requests.exceptions.Timeout:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 if args.verbose:
-                    print(f"{C_DIM}{port:<8} | TIMEOUT{C_RESET}", flush=True)
+                    print(
+                        f"{C_DIM}{port:<8} | TIMEOUT | {elapsed_ms:.1f}ms{C_RESET}",
+                        flush=True,
+                    )
             except requests.exceptions.RequestException as e:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 if args.verbose:
-                    print(f"{C_DIM}{port:<8} | ERROR: {e.__class__.__name__}{C_RESET}", flush=True)
+                    print(
+                        f"{C_DIM}{port:<8} | ERROR: {e.__class__.__name__} | {elapsed_ms:.1f}ms{C_RESET}",
+                        flush=True,
+                    )
 
             if scan_delay > 0:
                 time.sleep(scan_delay)
